@@ -178,4 +178,4 @@ with client.messages.stream(
 
 - IMA 模型需要 prompt 注入才能触发 tool calling（非原生支持）
 - 流式输出中的 `<function_call>` 块会被服务器端过滤（客户端不可见）
-- IMA 会话限制约 10 轮，超出后需重新建立
+- IMA 会话限制约 20 轮，超出后需重新建立
