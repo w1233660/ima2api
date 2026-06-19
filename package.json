@@ -1,0 +1,15 @@
+{
+  "name": "ima2api",
+  "version": "1.0.0",
+  "description": "IMA AI API reverse-engineered server - OpenAI + Anthropic compatible API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["ima", "ai", "openai", "anthropic", "api"],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
