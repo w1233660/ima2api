@@ -2,12 +2,14 @@
 
 逆向 IMA App 的 AI API，封装为 **OpenAI Chat Completions** 和 **Anthropic Messages** 兼容格式，支持 **tool calling**（prompt 注入方式）。
 
+一次抓包即可，之后都会自动刷新cookie。
+
 ## 快速开始
 
 ```bash
 cd ima2api
 npm install
-npm start
+python3 ima_runner.py
 ```
 
 ## 配置
@@ -19,7 +21,9 @@ npm start
   "server": { "port": 8080, "host": "0.0.0.0" },
   "auth": {
     // 从 IMA App 抓包获取的完整 Cookie
-    "cookie": "IMA-GUID=...;IMA-TOKEN=...;..."
+    "cookie": "IMA-GUID=...;IMA-TOKEN=...;...",
+    "refresh_token": "抓包https://ima.qq.com/auth_login/refresh请求获取",
+    "registration_id": "抓包https://ima.qq.com/auth_login/refresh请求获取"
   },
   "api_keys": ["sk-ima-demo-key-change-me"],
   "default_model": "glm-5.2"
@@ -32,6 +36,7 @@ npm start
 2. 配置 HTTPS 代理（mitmproxy / Charles / Fiddler）
 3. 发送任意消息，复制请求中的 `x-ima-cookie` 值
 4. 填入 `config.json` → `auth.cookie`
+5. 将 https://ima.qq.com/auth_login/refresh 这条请求里的refresh_token和registration_id也填入config.json (用于自动刷新cookie)
 
 ## API 端点
 
@@ -178,4 +183,4 @@ with client.messages.stream(
 
 - IMA 模型需要 prompt 注入才能触发 tool calling（非原生支持）
 - 流式输出中的 `<function_call>` 块会被服务器端过滤（客户端不可见）
-- IMA 会话限制约 20 轮，超出后需重新建立
+- IMA 会话限制约 10 轮，超出后需重新建立

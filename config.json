@@ -4,7 +4,9 @@
     "host": "0.0.0.0"
   },
   "auth": {
-    "cookie": "请填写"
+    "cookie": "抓包获取并填入",
+    "refresh_token": "抓包获取并填入",
+    "registration_id": "抓包获取并填入"
   },
   "api_keys": [
     "sk-ima-demo-key-change-me"
