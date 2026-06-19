@@ -41,6 +41,7 @@ const IMA_HEADERS = {
   origin: BASE_URL,
   "User-Agent": "okhttp/4.12.0",
   "Content-Type": "application/json; charset=utf-8",
+  "Accept-Encoding": "gzip",  // ⭐ 修复: 与真实 App 请求头一致
 };
 
 function imaPost(path, body, extraH = {}, timeout = 30000) {
@@ -51,13 +52,20 @@ function imaPost(path, body, extraH = {}, timeout = 30000) {
       headers: { ...IMA_HEADERS, ...extraH, "Content-Length": Buffer.byteLength(payload) },
       timeout,
     }, (res) => {
+      // ⭐ 修复: 处理 gzip 压缩响应（与 Accept-Encoding: gzip 配套）
+      const zlib = require("zlib");
+      const encoding = res.headers["content-encoding"] || "";
+      let stream = res;
+      if (encoding === "gzip") stream = res.pipe(zlib.createGunzip());
+      else if (encoding === "deflate") stream = res.pipe(zlib.createInflate());
       const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
+      stream.on("data", (c) => chunks.push(c));
+      stream.on("end", () => {
         const raw = Buffer.concat(chunks).toString("utf-8");
         try { resolve({ status: res.statusCode, data: JSON.parse(raw) }); }
         catch { resolve({ status: res.statusCode, data: raw }); }
       });
+      stream.on("error", reject);
     });
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
@@ -118,7 +126,7 @@ async function imaInitSession(question) {
   const { data } = await imaPost("/cgi-bin/session_logic/init_session", {
     env_info: { interact_type: 2, robot_type: 10000 },
     name: (question || "新对话").slice(0, 50),
-    msgs_limit: 10,
+    msgs_limit: 20,  // IMA 上限为 20（超过会报 code=51）
   });
   if (data.code === 0) return data.session_id;
   throw new Error(`InitSession failed: code=${data.code} msg=${data.msg}`);
@@ -161,12 +169,38 @@ function getCachedSession(convId) {
   return null;
 }
 
-async function ensureSession(convId, question) {
-  const c = getCachedSession(convId);
-  if (c) return c;
+async function ensureSession(convId, question, forceNew = false) {
+  if (!forceNew) {
+    const c = getCachedSession(convId);
+    if (c) return c;
+  }
   const id = await imaInitSession(question);
   if (convId) sessions.set(convId, { id, ts: Date.now() });
   return id;
+}
+
+// ⭐ 修复: IMA 会话达到 msgs_limit 后自动重建，避免"突然结束"
+async function imaQaStreamWithRetry(convId, question, modelType, modelId) {
+  let sessionId = await ensureSession(convId, question);
+  const events = await imaQaStream(sessionId, question, modelType, modelId);
+  // 收集并检测是否触发会话限制错误（INNER_EXCEPTION 含 session limit）
+  return (async function*() {
+    let hitLimit = false;
+    for await (const evt of events) {
+      if (evt.event === "INNER_EXCEPTION") {
+        // IMA 会话满了通常返回 INNER_EXCEPTION，此时重建 session 重试一次
+        try {
+          const newId = await ensureSession(convId, question, true);
+          const retryEvents = await imaQaStream(newId, question, modelType, modelId);
+          for await (const e2 of retryEvents) yield e2;
+        } catch (_) {
+          yield evt; // 重试也失败，把原始事件透传出去
+        }
+        return;
+      }
+      yield evt;
+    }
+  })();
 }
 
 // ============================================================
@@ -608,11 +642,21 @@ async function openaiChat(req, res, body) {
         return c.length > 10 && !c.startsWith('<session') && !c.startsWith('<system-reminder');
       });
       if (realMsgs.length > 1) {
-        const history = realMsgs
+        // ⭐ 修复: 扩展到 20 条，按字符数动态裁剪
+        const MAX_HISTORY_CHARS = 6000;
+        const recentMsgs = realMsgs
           .filter(m => m.role === "user" || m.role === "assistant")
-          .slice(-6)
-          .map(m => `${m.role === "user" ? "User" : "Assistant"}: ${extractContent(m)}`)
-          .join("\n");
+          .slice(-20);
+        let historyParts = [];
+        let historyLen = 0;
+        for (let i = recentMsgs.length - 1; i >= 0; i--) {
+          const m = recentMsgs[i];
+          const line = `${m.role === "user" ? "User" : "Assistant"}: ${extractContent(m)}`;
+          if (historyLen + line.length > MAX_HISTORY_CHARS && historyParts.length > 0) break;
+          historyParts.unshift(line);
+          historyLen += line.length + 1;
+        }
+        const history = historyParts.join("\n");
         question = (sysPrompt ? sysPrompt + "\n\n" : "") + (toolsPrompt ? toolsPrompt + "\n\n---\n" : "") + history;
       } else {
         question = `${sysPrompt ? "(Background)\n" + sysPrompt + "\n\n" : ""}${toolsPrompt}\n\n---\nUser message (respond to this):\n${lastUserMsg}`;
@@ -623,13 +667,19 @@ async function openaiChat(req, res, body) {
       const overhead = toolsPrompt.length + lastUserMsg.length + 200;
       const remaining = MAX_QUESTION - overhead;
 
-      if (context && context.length > remaining) {
-        // 提取 project_layout 部分
+      if (context && context.length > remaining && remaining > 0) {
+        // ⭐ 修复: 保留头尾，中间裁剪（保留核心规则 + 最新文件信息）
         const layoutMatch = context.match(/<project_layout>([\s\S]*?)<\/project_layout>/);
         const layoutSummary = layoutMatch
           ? layoutMatch[1].trim().split("\n").slice(0, 30).join("\n")
           : "";
-        context = `Directory (top 30 entries):\n${layoutSummary}`.slice(0, remaining);
+        const headLen = Math.min(800, Math.floor(remaining * 0.6));
+        const tailLen = Math.min(400, remaining - headLen);
+        const head = context.slice(0, headLen);
+        const tail = context.length > headLen + tailLen ? context.slice(-tailLen) : "";
+        const layoutPart = layoutSummary ? "\n\nDirectory (summary):\n" + layoutSummary.slice(0, Math.min(300, remaining - headLen - tailLen - 50)) : "";
+        context = tail ? head + "\n...[truncated]..." + layoutPart + "\n" + tail : head + layoutPart;
+        context = context.slice(0, remaining);
       }
 
       question = `${context ? "(Background)\n" + context + "\n\n" : ""}${toolsPrompt}\n\n---\nUser message (respond to this):\n${lastUserMsg}`;
@@ -659,10 +709,14 @@ async function openaiChat(req, res, body) {
 
 
   // 会话 — 复用 IMA session 保持对话记忆
+  // ⭐ 修复: 用系统 prompt 作为稳定锚点（同 Anthropic 路径保持一致）
   let oaiConvId = req.headers["x-conversation-id"] || req.headers["x-session-id"] || "";
   if (!oaiConvId && messages.length > 0) {
-    const firstMsg = extractContent(messages[0]).slice(0, 100);
-    oaiConvId = "conv-" + crypto.createHash("md5").update(firstMsg).digest("hex").slice(0, 12);
+    const sysMsg = messages.find(m => m.role === "system");
+    const anchor = sysMsg
+      ? extractContent(sysMsg).slice(0, 200)
+      : extractContent(messages[0]).slice(0, 200);
+    oaiConvId = "conv-" + crypto.createHash("md5").update(anchor).digest("hex").slice(0, 12);
   }
   let sessionId;
   try {
@@ -674,7 +728,7 @@ async function openaiChat(req, res, body) {
   // --- 非流式 ---
   if (!stream) {
     try {
-      const events = await imaQaStream(sessionId, question, model.type, model.id);
+      const events = await imaQaStreamWithRetry(oaiConvId, question, model.type, model.id);
       const text = await collectResponseText(events);
       const parsed = parseFunctionCalls(text);
 
@@ -732,7 +786,7 @@ async function openaiChat(req, res, body) {
   }
 
   try {
-    const events = await imaQaStream(sessionId, question, model.type, model.id);
+    const events = await imaQaStreamWithRetry(oaiConvId, question, model.type, model.id);
     const filter = new StreamFilter();
     let done = false;
 
@@ -970,9 +1024,19 @@ async function anthropicMessages(req, res, body) {
         return c.length > 5;
       });
     if (realMsgs.length > 1) {
-      question = realMsgs.slice(-6)
-        .map(m => (m.role === "user" ? "User" : "Assistant") + ": " + stripMetadata(extractContent(m)))
-        .join("\n");
+      // ⭐ 修复: 从 6 条扩展到 20 条，并按总字符限制动态裁剪（保留最新的消息）
+      const MAX_HISTORY_CHARS = 6000; // 留出空间给 sysPrompt + toolsPrompt
+      const recentMsgs = realMsgs.slice(-20);
+      let historyParts = [];
+      let historyLen = 0;
+      for (let i = recentMsgs.length - 1; i >= 0; i--) {
+        const m = recentMsgs[i];
+        const line = (m.role === "user" ? "User" : "Assistant") + ": " + stripMetadata(extractContent(m));
+        if (historyLen + line.length > MAX_HISTORY_CHARS && historyParts.length > 0) break;
+        historyParts.unshift(line);
+        historyLen += line.length + 1;
+      }
+      question = historyParts.join("\n");
       question = (sysPrompt ? sysPrompt + "\n\n" : "") + (toolsPrompt ? toolsPrompt + "\n\n---\n" : "") + question;
     } else {
       // 只有一条真正消息，走单轮路径
@@ -982,10 +1046,18 @@ async function anthropicMessages(req, res, body) {
     let context = sysPrompt;
     const overhead = toolsPrompt.length + lastUserMsg.length + 200;
     const remaining = MAX_QUESTION - overhead;
-    if (context && context.length > remaining) {
+    if (context && context.length > remaining && remaining > 0) {
+      // ⭐ 修复: 保留头部（核心规则）+ 尾部（最新文件列表），中间裁剪
+      // 而非旧逻辑的"只保留前500字+目录"，那样会丢失大量重要指令
       const layoutMatch = context.match(/<project_layout>([\s\S]*?)<\/project_layout>/);
       const layoutSummary = layoutMatch ? layoutMatch[1].trim().split("\n").slice(0, 30).join("\n") : "";
-      context = (context.slice(0, 500) + "\n\nDirectory:\n" + layoutSummary).slice(0, remaining);
+      const headLen = Math.min(800, Math.floor(remaining * 0.6));
+      const tailLen = Math.min(400, remaining - headLen);
+      const head = context.slice(0, headLen);
+      const tail = context.length > headLen + tailLen ? context.slice(-tailLen) : "";
+      const layoutPart = layoutSummary ? "\n\nDirectory (summary):\n" + layoutSummary.slice(0, Math.min(300, remaining - headLen - tailLen - 50)) : "";
+      context = tail ? head + "\n...[truncated]..." + layoutPart + "\n" + tail : head + layoutPart;
+      context = context.slice(0, remaining);
     }
     question = (context ? "(Background)\n" + context + "\n\n" : "") + toolsPrompt + "\n\n---\nUser message (respond to this):\n" + lastUserMsg;
   }
@@ -1009,11 +1081,16 @@ async function anthropicMessages(req, res, body) {
 
   // 会话 — ⭐ 关键: 必须复用 IMA session 才能保持对话记忆
   const convId = req.headers["x-conversation-id"] || req.headers["x-session-id"] || "";
-  // 如果没有会话 ID，用 messages 的 hash 作为 fallback (同一轮对话的 messages 前缀相同)
+  // ⭐ 修复: 用系统 prompt + 第一条用户消息的 hash 作为稳定会话锚点
+  // Claude Code 不发 x-conversation-id, 但同一对话的 system prompt 内容固定
   let effectiveConvId = convId;
   if (!effectiveConvId && messages.length > 0) {
-    const firstMsg = extractContent(messages[0]).slice(0, 100);
-    effectiveConvId = "conv-" + crypto.createHash("md5").update(firstMsg).digest("hex").slice(0, 12);
+    // 优先用 system prompt (Claude Code 在 system 里放项目路径等固定信息)
+    const sysMsg = messages.find(m => m.role === "system");
+    const anchor = sysMsg
+      ? extractContent(sysMsg).slice(0, 200)           // system prompt 前200字，通常含项目路径
+      : extractContent(messages[0]).slice(0, 200);      // fallback: 第一条消息
+    effectiveConvId = "conv-" + crypto.createHash("md5").update(anchor).digest("hex").slice(0, 12);
   }
   let sessionId;
   const isNewSession = !getCachedSession(effectiveConvId);
@@ -1026,7 +1103,7 @@ async function anthropicMessages(req, res, body) {
   // --- 非流式 ---
   if (!stream) {
     try {
-      const events = await imaQaStream(sessionId, question, model.type, model.id);
+      const events = await imaQaStreamWithRetry(effectiveConvId, question, model.type, model.id);
       const text = await collectResponseText(events);
       const parsed = parseFunctionCalls(text);
 
@@ -1092,7 +1169,7 @@ async function anthropicMessages(req, res, body) {
   const filter = new StreamFilter();
   let calls = [];  // 在 try 外声明，供后续 tool_use 发送使用
   try {
-    const events = await imaQaStream(sessionId, question, model.type, model.id);
+    const events = await imaQaStreamWithRetry(effectiveConvId, question, model.type, model.id);
 
     for await (const evt of events) {
       if (resClosed) break;
