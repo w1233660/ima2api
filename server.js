@@ -94,29 +94,56 @@ function imaSse(path, body) {
   });
 }
 
+function parseSSEBlock(part) {
+  let event = "";
+  const dataLines = [];
+  for (const line of part.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    else if (line.startsWith("data")) dataLines.push("");
+  }
+  return { event, data: dataLines.join("\n") };
+}
+
 async function* parseSSE(readable) {
   let buf = "";
   for await (const chunk of readable) {
     buf += chunk.toString("utf-8");
-    const parts = buf.split("\n\n"); buf = parts.pop() || "";
+    const parts = buf.split(/\r?\n\r?\n/); buf = parts.pop() || "";
     for (const part of parts) {
       if (!part.trim()) continue;
-      const evt = { event: "", data: "" };
-      for (const line of part.split("\n")) {
-        if (line.startsWith("event:")) evt.event = line.slice(6).trim();
-        else if (line.startsWith("data:")) evt.data = line.slice(5).trim();
-      }
-      if (evt.event) yield evt;
+      const evt = parseSSEBlock(part);
+      if (evt.event || evt.data) yield evt;
     }
   }
   if (buf.trim()) {
-    const evt = { event: "", data: "" };
-    for (const line of buf.split("\n")) {
-      if (line.startsWith("event:")) evt.event = line.slice(6).trim();
-      else if (line.startsWith("data:")) evt.data = line.slice(5).trim();
-    }
-    if (evt.event) yield evt;
+    const evt = parseSSEBlock(buf);
+    if (evt.event || evt.data) yield evt;
   }
+}
+
+const CONTROL_EVENTS = new Set(["COMPLETED", "CLOSE", "INNER_EXCEPTION", "ERROR", "FAILED"]);
+const DEBUG_SSE = process.env.IMA_DEBUG === "1";
+
+function extractEventText(d) {
+  if (d == null) return "";
+  if (typeof d === "string") return d;
+  if (typeof d !== "object") return String(d);
+  for (const k of ["Text", "text", "Content", "content", "Delta", "delta", "Msg", "msg", "reply", "Reply", "answer", "Answer"]) {
+    const v = d[k];
+    if (typeof v === "string" && v) return v;
+  }
+  return "";
+}
+
+function eventText(evt) {
+  const raw = evt && evt.data;
+  if (!raw) return "";
+  let d;
+  try { d = JSON.parse(raw); }
+  catch { try { d = tryRepairJson(raw); } catch { d = null; } }
+  if (d == null) return "";
+  return extractEventText(d);
 }
 
 // ============================================================
@@ -146,13 +173,13 @@ function imaQaStream(sessionId, question, modelType, modelId) {
 
 async function collectResponseText(events) {
   let text = "";
+  const seen = [];
   for await (const evt of events) {
-    if (evt.event === "MESSAGE") {
-      try { const d = JSON.parse(evt.data); if (d.Text) text += d.Text; } catch {}
-    } else if (evt.event === "COMPLETED" || evt.event === "CLOSE" || evt.event === "INNER_EXCEPTION") {
-      break;
-    }
+    if (CONTROL_EVENTS.has(evt.event)) break;
+    text += eventText(evt);
+    if (DEBUG_SSE) seen.push(evt.event || "(none)");
   }
+  if (DEBUG_SSE && !text) console.error(`[SSE-EMPTY] events=${JSON.stringify(seen)}`);
   return text;
 }
 
@@ -187,7 +214,7 @@ async function imaQaStreamWithRetry(convId, question, modelType, modelId) {
   return (async function*() {
     let hitLimit = false;
     for await (const evt of events) {
-      if (evt.event === "INNER_EXCEPTION") {
+      if (evt.event === "INNER_EXCEPTION" || evt.event === "ERROR" || evt.event === "FAILED") {
         // IMA 会话满了通常返回 INNER_EXCEPTION，此时重建 session 重试一次
         try {
           const newId = await ensureSession(convId, question, true);
@@ -265,10 +292,30 @@ function extractContent(msg) {
 // 7. Function Calling — Prompt 注入引擎
 // ============================================================
 
-// 修复 LLM 常见的 JSON 错误 (未转义引号、尾逗号、缺括号)
+function escapeRawCtrlInStrings(s) {
+  let out = "", inStr = false, esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { out += c; esc = false; continue; }
+    if (c === "\\") { out += c; esc = true; continue; }
+    if (c === '"') { inStr = !inStr; out += c; continue; }
+    if (inStr) {
+      if (c === "\n") { out += "\\n"; continue; }
+      if (c === "\r") { out += "\\r"; continue; }
+      if (c === "\t") { out += "\\t"; continue; }
+    }
+    out += c;
+  }
+  return out;
+}
+
+// 修复 LLM 常见的 JSON 错误 (未转义引号、尾逗号、缺括号、字符串内裸换行)
 function tryRepairJson(raw) {
   try { return JSON.parse(raw); } catch (e) { /* continue */ }
   let fixed = raw;
+  // 0. 转义字符串内的裸控制符 (写文件时 content 含真实换行 → 否则 JSON.parse 失败)
+  fixed = escapeRawCtrlInStrings(fixed);
+  try { return JSON.parse(fixed); } catch (e) { /* continue */ }
   // 1. 去尾逗号
   fixed = fixed.replace(/,(\s*[}\]])/g, '$1');
   try { return JSON.parse(fixed); } catch (e) { /* continue */ }
@@ -339,7 +386,9 @@ function buildToolsPrompt(tools) {
 
 You have access to these functions. When the user asks you to do something
 that a function can handle, you MUST call the function. NEVER say "I cannot"
-or "I don't have the ability". ALWAYS use a function instead.
+or "I don't have the ability". NEVER tell the user to save a file, run a
+command, or do any step themselves — DO IT by calling the function (e.g. use
+Write to create files, Bash to run commands). ALWAYS use a function instead.
 
 ${funcDefs}
 
@@ -352,9 +401,54 @@ Output EXACTLY this format, then STOP:
 </function_call>
 
 Rules:
-- The JSON MUST be on a SINGLE line
 - arguments MUST be a valid JSON object matching the function's parameters
-- Do NOT add any text before or after the <function_call> block`;
+- For file content, put the FULL content in the string value (newlines allowed)
+- Do NOT add any text before or after the <function_call> block
+- NEVER output file content or code for the user to copy — write it via Write`;
+}
+
+// ⭐ 工具结果回传轮专用 — "继续行动"版工具提示。
+// 修复历史: ① 旧的强制版 ("YOU MUST call / 不要输出任何文本") 让模型回传轮要么再发多余
+// 调用要么沉默; ② 过软版 ("有足够信息就用纯文本作答") 又走向另一极端 —— 模型把"让我先读
+// 取文件"这种【意图叙述】当成回答然后停手, 多步任务半途而废。
+// 本版核心原则: 叙述意图 ≠ 完成任务。只要还有未完成的步骤, 必须【在本轮就发出函数调用】,
+// 不能只说"我接下来要做 X"。只有当任务真正全部完成时, 才用纯文本给出最终答复。
+function buildToolsPromptSoft(tools) {
+  if (!tools || tools.length === 0) return "";
+
+  const funcDefs = tools
+    .filter(t => t.type === "function" && t.function)
+    .map(t => {
+      const fn = t.function;
+      return `<function name="${fn.name}">
+<description>${fn.description || "No description"}</description>
+<parameters>${compactSchema(fn.parameters)}</parameters>
+</function>`;
+    })
+    .join("\n");
+
+  return `## Available functions
+
+${funcDefs}
+
+## CRITICAL — keep going until the task is fully done
+
+The user's request may need MULTIPLE steps. After each function result, decide:
+the task is NOT finished yet → call the next function NOW; the task IS fully
+finished → give the final answer in plain text.
+
+NEVER reply with only your intention (e.g. "Let me read the file", "I'll now
+start the server", "下一步我将…"). Stating intent is NOT an action and NOT an
+answer. If you intend to do something, you MUST emit the function call for it
+in THIS SAME reply.
+
+## To call a function
+Output EXACTLY: <function_call>{"name":"...","arguments":{...}}</function_call> then stop.
+(For file content, put the FULL content in the string value; newlines allowed.)
+
+## To finish
+Only when every step is done, reply to the user in plain text WITHOUT any
+<function_call> block.`;
 }
 
 // ⭐ StreamFilter: 实时过滤流式输出中的 <function_call> 块
@@ -366,6 +460,7 @@ class StreamFilter {
     this._funcBlocks = [];    // 捕获的 function_call JSON
     this._inFunc = false;     // 是否在 <function_call> 内部
     this._tagLen = 16;        // '<function_call>'.length
+    this._leftover = '';      // ⭐ parseCalls 无法解析的残留文本 (供流式层兜底输出)
   }
 
   // 喂入新文本块，返回应发送给客户端的纯净文本 (可能为空)
@@ -430,9 +525,14 @@ class StreamFilter {
   // 流结束时调用 — 返回可能残留的缓冲区内容 (不含 function_call 部分)
   flush() {
     if (this._inFunc) {
-      // 不完整的 function_call — 丢弃
+      // ⭐ 修复: 流在 </function_call> 到达前就结束了 (IMA 截断 / 模型漏写闭合标签)。
+      // 旧逻辑直接丢弃缓冲区, 导致"调用命令后无任何回复" — 这里改为把残留 JSON
+      // 当作一个 function block 捕获, 交给 parseCalls() 去尽力修复。
+      const pending = this._buf.trim();
+      if (pending) this._funcBlocks.push(pending);
       this._buf = '';
       this._inFunc = false;
+      return '';
     }
     if (this._buf) {
       this._emitted += this._buf;
@@ -458,8 +558,11 @@ class StreamFilter {
           },
         });
       } else if (raw.length > 0) {
-        // JSON 修复失败 — 保留原文避免对话中断
-        this._emitted += '\n[Function call (malformed JSON)]:\n' + raw + '\n';
+        // ⭐ JSON 修复失败 — 累积到 _leftover, 由流式层兜底输出, 避免对话静默中断。
+        // (非流式走 cleanText/_emitted; 流式层需读取 leftover 单独 emit)
+        const note = '\n[Function call (malformed)]:\n' + raw + '\n';
+        this._emitted += note;
+        this._leftover += note;
       }
     }
     return calls;
@@ -467,6 +570,7 @@ class StreamFilter {
 
   get cleanText() { return this._emitted; }
   get hasFunc() { return this._funcBlocks.length > 0; }
+  get leftover() { return this._leftover; }
 }
 
 function parseFunctionCalls(text) {
@@ -604,7 +708,8 @@ async function openaiChat(req, res, body) {
     }
 
     // 工具结果回传轮: 不携带完整 sysPrompt, 仅 5 个核心工具
-    const minimalOAI = buildToolsPrompt(
+    // ⭐ 用软版提示 — 允许模型直接用文字作答, 避免被强制再发 function_call 而沉默
+    const minimalOAI = buildToolsPromptSoft(
       (effectiveTools || []).filter(t => ESSENTIAL_OAI.has(t.function?.name)).slice(0, 5)
     );
     question = minimalOAI + "\n\n---\n" + question;
@@ -742,7 +847,8 @@ async function openaiChat(req, res, body) {
         };
         choice.finish_reason = "tool_calls";
       } else {
-        choice.message = { role: "assistant", content: text };
+        // ⭐ 兜底: 空文本时给出占位, 避免客户端收到完全空的回复
+        choice.message = { role: "assistant", content: text || "(本轮没有生成内容，请重试或换一种问法。)" };
       }
 
       return json(res, 200, {
@@ -770,6 +876,7 @@ async function openaiChat(req, res, body) {
   const chatId = "chatcmpl-" + crypto.randomUUID().slice(0, 8);
   const created = Math.floor(Date.now() / 1000);
   let resClosed = false;
+  let sentText = false;   // ⭐ 是否已向客户端发送过任何文本/工具内容 (兜底判断)
   res.on('close', () => { resClosed = true; });
 
   function emit(delta, finishReason, toolCalls) {
@@ -778,6 +885,7 @@ async function openaiChat(req, res, body) {
       const d = toolCalls && toolCalls.length > 0
         ? { role: "assistant", tool_calls: toolCalls }
         : { role: "assistant", content: delta };
+      if ((delta && delta.length > 0) || (toolCalls && toolCalls.length > 0)) sentText = true;
       res.write("data: " + JSON.stringify({
         id: chatId, object: "chat.completion.chunk", created, model: modelKey,
         choices: [{ index: 0, delta: d, finish_reason: finishReason }],
@@ -790,23 +898,21 @@ async function openaiChat(req, res, body) {
     const filter = new StreamFilter();
     let done = false;
 
+    let sawEvent = false;
     for await (const evt of events) {
       if (resClosed) break;
-      if (evt.event === "MESSAGE") {
-        try {
-          const d = JSON.parse(evt.data);
-          if (d.Text) {
-            const clean = filter.feed(d.Text);
-            if (clean) emit(clean, null, null);
-          }
-        } catch {}
-      } else if (evt.event === "COMPLETED" || evt.event === "CLOSE") {
-        done = true;
-        break;
-      } else if (evt.event === "INNER_EXCEPTION") {
+      if (CONTROL_EVENTS.has(evt.event)) {
+        if (evt.event === "COMPLETED" || evt.event === "CLOSE") done = true;
         break;
       }
+      sawEvent = true;
+      const txt = eventText(evt);
+      if (txt) {
+        const clean = filter.feed(txt);
+        if (clean) emit(clean, null, null);
+      }
     }
+    if (DEBUG_SSE && !sawEvent) console.error("[SSE-EMPTY] openai stream: no data events");
 
     // 冲刷残留缓冲
     const flushed = filter.flush();
@@ -815,12 +921,15 @@ async function openaiChat(req, res, body) {
     // 检测并发送函数调用
     if (!resClosed) {
       const calls = filter.parseCalls();
+      // ⭐ 无法解析的 function_call 残留 — 作为文本输出, 避免静默丢失
+      if (filter.leftover) emit(filter.leftover, null, null);
       if (calls.length > 0) {
         // ⭐ OpenAI streaming tool_calls: 逐个发送
         for (let i = 0; i < calls.length; i++) {
           const tc = calls[i];
           if (resClosed) break;
           try {
+            sentText = true;
             res.write("data: " + JSON.stringify({
               id: chatId, object: "chat.completion.chunk", created, model: modelKey,
               choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }],
@@ -834,6 +943,14 @@ async function openaiChat(req, res, body) {
           }) + "\n\n");
         }
       } else {
+        // ⭐ 兜底: 流正常结束但既无文本也无工具调用 (模型只回了被过滤的内容 /
+        // 空响应 / 异常中断)。绝不让客户端收到完全空的回复 — 这是"无回复就结束"的根因。
+        if (!sentText && !resClosed) {
+          const fb = done
+            ? "(本轮没有生成内容，请重试或换一种问法。)"
+            : "(响应在完成前被中断，请重试。)";
+          emit(fb, null, null);
+        }
         // done 为 true 表示正常完成
         res.write("data: " + JSON.stringify({
           id: chatId, object: "chat.completion.chunk", created, model: modelKey,
@@ -1010,7 +1127,8 @@ async function anthropicMessages(req, res, body) {
 
     // ⭐ 工具结果回传轮: 不携带完整 sysPrompt 和大量 tools (⚠️ 通知已提供足够上下文)
     // 仅保留 5 个核心工具, 确保总长度 < 10000 不会被后面的通用截断逻辑破坏
-    const minimalToolsPrompt = buildToolsPrompt(
+    // ⭐ 用软版提示 — 允许模型基于结果直接用文字回答, 而非被强制再发 function_call
+    const minimalToolsPrompt = buildToolsPromptSoft(
       displayTools.filter(t => ESSENTIAL_TOOLS.has(t.name)).slice(0, 5)
         .map(t => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.input_schema || {} } }))
     );
@@ -1128,7 +1246,8 @@ async function anthropicMessages(req, res, body) {
       return json(res, 200, {
         id: "msg_" + crypto.randomUUID().slice(0, 8),
         type: "message", role: "assistant", model: modelKey,
-        content: [{ type: "text", text }],
+        // ⭐ 兜底: 空文本时给出占位, 避免客户端收到空 content
+        content: [{ type: "text", text: text || "(本轮没有生成内容，请重试或换一种问法。)" }],
         stop_reason: "end_turn", stop_sequence: null,
         usage: { input_tokens: 0, output_tokens: 0 },
       });
@@ -1166,6 +1285,7 @@ async function anthropicMessages(req, res, body) {
 
   let stopReason = "end_turn";
   let done = false;
+  let sentText = false;   // ⭐ 是否已发送过任何文本 delta (兜底判断)
   const filter = new StreamFilter();
   let calls = [];  // 在 try 外声明，供后续 tool_use 发送使用
   try {
@@ -1173,29 +1293,40 @@ async function anthropicMessages(req, res, body) {
 
     for await (const evt of events) {
       if (resClosed) break;
-      if (evt.event === "MESSAGE") {
-        try {
-          const d = JSON.parse(evt.data);
-          if (d.Text) {
-            const clean = filter.feed(d.Text);
-            if (clean) em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: clean } });
-          }
-        } catch {}
-      } else if (evt.event === "COMPLETED" || evt.event === "CLOSE") {
-        done = true;
+      if (CONTROL_EVENTS.has(evt.event)) {
+        if (evt.event === "COMPLETED" || evt.event === "CLOSE") done = true;
         break;
-      } else if (evt.event === "INNER_EXCEPTION") {
-        break;
+      }
+      const txt = eventText(evt);
+      if (txt) {
+        const clean = filter.feed(txt);
+        if (clean) { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: clean } }); sentText = true; }
       }
     }
 
     // 冲刷残留缓冲
     const flushed = filter.flush();
-    if (flushed && !resClosed) em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: flushed } });
+    if (flushed && !resClosed) { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: flushed } }); sentText = true; }
 
     calls = filter.parseCalls();
+    // ⭐ 无法解析的 function_call 残留 — 作为文本输出, 避免静默丢失
+    if (filter.leftover && !resClosed) { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: filter.leftover } }); sentText = true; }
+
+    // ⭐ 兜底: 流结束但既无文本也无工具调用 — 绝不让客户端收到完全空的回复。
+    // 这是 Claude Code "执行命令后无任何回复就结束" 的最终防线。
+    if (!sentText && calls.length === 0 && !resClosed) {
+      const fb = done
+        ? "(本轮没有生成内容，请重试或换一种问法。)"
+        : "(响应在完成前被中断，请重试。)";
+      em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: fb } });
+      sentText = true;
+    }
   } catch (e) {
     console.error(`[ANTHROPIC-STREAM-ERR] ${e.message}`);
+    // ⭐ 异常路径同样兜底, 保证至少有一段文本
+    if (!sentText && !resClosed) {
+      try { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "(响应处理出错，请重试。)" } }); sentText = true; } catch {}
+    }
   }
 
   // 结束文本块 (仅在未截停时)
