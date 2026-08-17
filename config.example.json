@@ -1,0 +1,63 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+  "admin": {
+    "password": "change-me",
+    "session_secret": "change-me-too"
+  },
+  "auth": {
+    "cookie": "",
+    "refresh_token": "",
+    "registration_id": "",
+    "login_source": ""
+  },
+  "accounts": [],
+  "api_keys": [
+    "sk-ima-demo-key-change-me"
+  ],
+  "default_model": "glm-5.3",
+  "models": {
+    "hy-2.0": {
+      "type": 0,
+      "id": "official_0",
+      "name": "Tencent HY 2.0"
+    },
+    "hy-2.0-think": {
+      "type": 2,
+      "id": "official_2",
+      "name": "Tencent HY 2.0 Think"
+    },
+    "deepseek-v3.2": {
+      "type": 4,
+      "id": "official_4",
+      "name": "DeepSeek V3.2"
+    },
+    "deepseek-v3.2-think": {
+      "type": 5,
+      "id": "official_5",
+      "name": "DeepSeek V3.2 Think"
+    },
+    "glm-5.3": {
+      "type": 3000,
+      "id": "official_3000",
+      "name": "智谱 GLM-5.3"
+    },
+    "glm-5.3-think": {
+      "type": 3001,
+      "id": "official_3001",
+      "name": "智谱 GLM-5.3 Think"
+    },
+    "kimi-k2.5": {
+      "type": 4000,
+      "id": "official_4000",
+      "name": "Kimi K2.5"
+    },
+    "kimi-k2.5-think": {
+      "type": 4001,
+      "id": "official_4001",
+      "name": "Kimi K2.5 Think"
+    }
+  }
+}

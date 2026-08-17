@@ -3,45 +3,18 @@
     "port": 8080,
     "host": "0.0.0.0"
   },
+  "admin": {
+    "password": "change-me",
+    "session_secret": "change-me-too"
+  },
   "auth": {
     "cookie": "抓包获取并填入",
     "refresh_token": "抓包获取并填入",
     "registration_id": "抓包获取并填入"
   },
+  "accounts": [],
   "api_keys": [
     "sk-ima-demo-key-change-me"
   ],
-  "default_model": "glm-5.2",
-  "models": {
-    "hy3-preview": {
-      "type": 0,
-      "id": "official_0",
-      "name": "Tencent Hy3 preview"
-    },
-    "hy3-preview-think": {
-      "type": 2,
-      "id": "official_2",
-      "name": "Tencent Hy3 preview (Think)"
-    },
-    "deepseek-v4-flash": {
-      "type": 3,
-      "id": "official_3",
-      "name": "DeepSeek V4-Flash"
-    },
-    "deepseek-v4-flash-think": {
-      "type": 1,
-      "id": "official_1",
-      "name": "DeepSeek V4-Flash (Think)"
-    },
-    "glm-5.2": {
-      "type": 3000,
-      "id": "official_3000",
-      "name": "GLM-5.2"
-    },
-    "glm-5.2-think": {
-      "type": 3001,
-      "id": "official_3001",
-      "name": "GLM-5.2 (Think)"
-    }
-  }
+  "default_model": "glm-5.3"
 }

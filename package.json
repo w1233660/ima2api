@@ -1,15 +1,13 @@
 {
   "name": "ima2api",
-  "version": "1.0.0",
-  "description": "IMA AI API reverse-engineered server - OpenAI + Anthropic compatible API",
-  "main": "server.js",
+  "version": "1.1.0",
+  "description": "IMA AI API + web admin QR login",
+  "main": "app.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node app.js"
   },
-  "keywords": ["ima", "ai", "openai", "anthropic", "api"],
   "license": "MIT",
   "dependencies": {
-    "express": "^4.21.0"
+    "playwright-core": "^1.55.0"
   }
 }

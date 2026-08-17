@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ima2api</title>
+  <link rel="stylesheet" href="/admin.css" />
+</head>
+<body>
+  <div class="page">
+    <header>
+      <span class="logo">ima2api</span>
+      <button id="logoutBtn" class="btn hidden" type="button">退出</button>
+    </header>
+
+    <section id="loginCard" class="card">
+      <h2>登录</h2>
+      <p class="hint">管理页密码，不是 IMA 账号。</p>
+      <form id="loginForm" class="row">
+        <input id="password" type="password" placeholder="密码" autocomplete="current-password" />
+        <button type="submit" class="btn primary">进入</button>
+      </form>
+      <p id="loginErr" class="err"></p>
+    </section>
+
+    <div id="dash" class="hidden">
+      <section class="card">
+        <h2>当前账号</h2>
+        <div id="statusBox">还没有账号</div>
+        <p id="keepHint" class="hint"></p>
+        <button id="keepBtn" class="btn" type="button">马上续期</button>
+      </section>
+
+      <section class="card">
+        <h2>账号列表</h2>
+        <p class="hint">GLM-5.3 需要手机 App 抓包。网页扫码只是备用，不会覆盖 App 账号。</p>
+        <ul id="accountList"></ul>
+        <p id="accountMsg" class="hint"></p>
+      </section>
+
+      <section class="card">
+        <h2>导入抓包</h2>
+        <p class="hint">把 StormSniffer / Charles 导出的 .har 拖进来，或点选文件。</p>
+        <div id="harDrop" class="drop">把 .har 拖到这里</div>
+        <input id="harFile" type="file" accept=".har,application/json" />
+        <p id="harMsg" class="hint"></p>
+      </section>
+
+      <section class="card">
+        <h2>微信扫码</h2>
+        <p class="hint">这是网页登录。GLM-5.3 经常不可用。</p>
+        <div class="row">
+          <button id="startBtn" class="btn primary" type="button">开始扫码</button>
+          <button id="cancelBtn" class="btn" type="button">取消</button>
+        </div>
+        <p id="jobMsg" class="hint"></p>
+        <img id="qrImg" class="qr hidden" alt="二维码" />
+      </section>
+
+      <section class="card">
+        <h2>接口密钥</h2>
+        <p class="hint">给 New API 或其他软件调用用。</p>
+        <ul id="keyList"></ul>
+        <form id="keyForm" class="row">
+          <input id="newKey" placeholder="sk-..." />
+          <button type="submit" class="btn primary">添加</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>手动填写</h2>
+        <p class="hint">没有 HAR 文件时，把抓包里的三项贴过来。</p>
+        <label>Cookie</label>
+        <textarea id="cookie" rows="4" placeholder="x-ima-cookie 整段"></textarea>
+        <label>refresh_token</label>
+        <input id="refresh" placeholder="长期票，可空" />
+        <label>registration_id</label>
+        <input id="registration" placeholder="App 才有，网页登录留空" />
+        <button id="manualBtn" class="btn primary" type="button">保存</button>
+      </section>
+    </div>
+  </div>
+  <script src="/admin.js"></script>
+</body>
+</html>

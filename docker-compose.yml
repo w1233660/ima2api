@@ -1,0 +1,16 @@
+services:
+  ima2api:
+    build:
+      context: .
+    image: ima2api:local
+    container_name: ima2api
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      CHROME_PATH: /usr/bin/chromium-browser
+    volumes:
+      - ./data/config.json:/app/config.json
+    ports:
+      - "8080:8080"

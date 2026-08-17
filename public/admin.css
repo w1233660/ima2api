@@ -1,0 +1,98 @@
+body {
+  margin: 0;
+  background: #eef0f3;
+  color: #1f2328;
+  font: 14px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.logo { font-size: 18px; font-weight: 650; }
+.card {
+  background: #fff;
+  border: 1px solid #d8dde3;
+  border-radius: 8px;
+  padding: 14px 16px 16px;
+  margin-bottom: 12px;
+}
+h2 { margin: 0 0 6px; font-size: 15px; }
+.hint { margin: 6px 0; color: #5b6570; }
+.err { color: #b42318; min-height: 1.2em; }
+label { display: block; margin-top: 8px; color: #444; }
+input, textarea, button { font: inherit; }
+input, textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #c9ced4;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 4px 0 0;
+  background: #fff;
+}
+textarea { resize: vertical; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row input { margin: 0; }
+.btn {
+  border: 1px solid #c9ced4;
+  background: #fff;
+  border-radius: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.btn.primary {
+  background: #2f6fed;
+  border-color: #2f6fed;
+  color: #fff;
+}
+.btn:hover { filter: brightness(0.97); }
+.hidden { display: none !important; }
+#statusBox {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #f4f6f8;
+}
+#statusBox.ok { background: #e8f5ec; color: #1d6b34; }
+#statusBox.bad { background: #fdecea; color: #b42318; }
+.qr {
+  display: block;
+  width: 220px;
+  margin-top: 10px;
+  border: 1px solid #d8dde3;
+  background: #fff;
+  padding: 8px;
+}
+ul { margin: 8px 0 0; padding-left: 18px; }
+#accountList { list-style: none; padding: 0; }
+#accountList li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid #e3e7eb;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: #fafbfc;
+}
+#accountList li.active { border-color: #8fbf9a; background: #eef7f0; }
+.meta { color: #667085; font-size: 12px; margin-top: 3px; }
+.actions { display: flex; gap: 6px; flex-shrink: 0; }
+.drop {
+  border: 1px dashed #b4bcc6;
+  border-radius: 6px;
+  padding: 22px 10px;
+  text-align: center;
+  color: #667085;
+  margin: 8px 0;
+  background: #fafbfc;
+}
+.drop.over { border-color: #2f6fed; color: #2f6fed; background: #f3f7ff; }
+#harFile { margin-top: 8px; }

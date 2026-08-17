@@ -8,22 +8,54 @@ const crypto = require("crypto");
 // ============================================================
 // 1. 配置
 // ============================================================
-const CONFIG = require("./config.json");
+let CONFIG = require("./config.json");
 const BASE_HOST = "ima.qq.com";
 const BASE_URL = "https://ima.qq.com";
-const COOKIE = CONFIG.auth.cookie;
-const API_KEYS = new Set(CONFIG.api_keys || []);
+let COOKIE = "";
+const API_KEYS = new Set();
+let IMA_TOKEN = "";
+let BKN = "";
 
-const IMA_TOKEN = (() => {
-  const m = COOKIE.match(/IMA-TOKEN=([^;]+)/);
-  return m ? m[1] : "";
-})();
-
-const BKN = (() => {
+function calcBkn(token) {
   let h = 5381;
-  for (let i = 0; i < IMA_TOKEN.length; i++) h += (h << 5) + IMA_TOKEN.charCodeAt(i);
+  for (let i = 0; i < token.length; i++) h += (h << 5) + token.charCodeAt(i);
   return String(h & 0x7fffffff);
-})();
+}
+
+function applyConfig(next) {
+  const prevCookie = COOKIE;
+  if (next) CONFIG = next;
+  COOKIE = (CONFIG.auth && CONFIG.auth.cookie) || "";
+  API_KEYS.clear();
+  for (const k of CONFIG.api_keys || []) API_KEYS.add(k);
+  const m = String(COOKIE).match(/IMA-TOKEN=([^;]+)/);
+  IMA_TOKEN = m ? m[1] : "";
+  BKN = calcBkn(IMA_TOKEN);
+  IMA_HEADERS["x-ima-cookie"] = COOKIE;
+  IMA_HEADERS["x-ima-bkn"] = BKN;
+  const clientType = String(COOKIE).match(/CLIENT-TYPE=([^;]+)/);
+  const loginSource = (CONFIG.auth && CONFIG.auth.login_source) || "";
+  if ((clientType && clientType[1] === "256002") || String(loginSource).includes("app") || (CONFIG.auth && CONFIG.auth.registration_id)) {
+    IMA_HEADERS["User-Agent"] = (CONFIG.auth && CONFIG.auth.user_agent) || "ima/1369 CFNetwork/1399 Darwin/22.1.0";
+  } else {
+    IMA_HEADERS["User-Agent"] = "okhttp/4.12.0";
+  }
+  MODELS = CONFIG.models || MODELS;
+  DEFAULT_MODEL = CONFIG.default_model || DEFAULT_MODEL;
+  // 换号后旧会话作废；同一账号只是续期，会话还要留着。
+  if (typeof sessions !== "undefined" && prevCookie && COOKIE) {
+    const prevUid = (String(prevCookie).match(/IMA-UID=([^;]+)/) || [])[1] || "";
+    const nextUid = (String(COOKIE).match(/IMA-UID=([^;]+)/) || [])[1] || "";
+    if (prevUid && nextUid && prevUid !== nextUid) sessions.clear();
+  }
+}
+
+function loadConfigFromDisk() {
+  const cfgPath = require("path").resolve(__dirname, "config.json");
+  delete require.cache[require.resolve(cfgPath)];
+  applyConfig(require(cfgPath));
+  return CONFIG;
+}
 
 function maskKey(k) {
   if (!k || k.length < 12) return "***";
@@ -35,8 +67,8 @@ function maskKey(k) {
 // ============================================================
 const IMA_HEADERS = {
   "from_browser_ima": "1",
-  "x-ima-cookie": COOKIE,
-  "x-ima-bkn": BKN,
+  "x-ima-cookie": "",
+  "x-ima-bkn": "",
   referer: BASE_URL,
   origin: BASE_URL,
   "User-Agent": "okhttp/4.12.0",
@@ -171,10 +203,23 @@ function imaQaStream(sessionId, question, modelType, modelId) {
   });
 }
 
+function completedError(evt) {
+  if (!evt || evt.event !== "COMPLETED" || !evt.data) return "";
+  try {
+    const d = JSON.parse(evt.data);
+    if (d && Number(d.Code) && Number(d.Code) !== 0) {
+      return d.Msg || `IMA 模型不可用 (code=${d.Code})`;
+    }
+  } catch {}
+  return "";
+}
+
 async function collectResponseText(events) {
   let text = "";
   const seen = [];
   for await (const evt of events) {
+    const fail = completedError(evt);
+    if (fail) throw new Error(fail);
     if (CONTROL_EVENTS.has(evt.event)) break;
     text += eventText(evt);
     if (DEBUG_SSE) seen.push(evt.event || "(none)");
@@ -188,6 +233,36 @@ async function collectResponseText(events) {
 // ============================================================
 const sessions = new Map();
 const SESSION_TTL = 30 * 60 * 1000;
+
+function clearImaSessions() {
+  sessions.clear();
+}
+
+function isDeadSessionMessage(msg) {
+  const text = String(msg || "");
+  return /会话已失效|会话不存在|会话.*删除|新建会话后重试/.test(text);
+}
+
+function isRateLimitMessage(msg) {
+  const text = String(msg || "");
+  return /提问太快|晚[点点]再来|访问过于频繁|请求过于频繁|稍后再试|too many|rate limit/i.test(text);
+}
+
+let rotateAccountHandler = null;
+function setRotateHandler(fn) {
+  rotateAccountHandler = typeof fn === "function" ? fn : null;
+}
+
+let lastAskAt = 0;
+const MIN_ASK_GAP_MS = 4000;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function paceAsk() {
+  const wait = lastAskAt + MIN_ASK_GAP_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastAskAt = Date.now();
+}
 
 function getCachedSession(convId) {
   const now = Date.now();
@@ -208,20 +283,22 @@ async function ensureSession(convId, question, forceNew = false) {
 
 // ⭐ 修复: IMA 会话达到 msgs_limit 后自动重建，避免"突然结束"
 async function imaQaStreamWithRetry(convId, question, modelType, modelId) {
+  await paceAsk();
   let sessionId = await ensureSession(convId, question);
   const events = await imaQaStream(sessionId, question, modelType, modelId);
-  // 收集并检测是否触发会话限制错误（INNER_EXCEPTION 含 session limit）
+  // 会话满了、换号后旧会话失效时，自动新建会话再问一次。
   return (async function*() {
-    let hitLimit = false;
     for await (const evt of events) {
-      if (evt.event === "INNER_EXCEPTION" || evt.event === "ERROR" || evt.event === "FAILED") {
-        // IMA 会话满了通常返回 INNER_EXCEPTION，此时重建 session 重试一次
+      const fail = completedError(evt);
+      if (isRateLimitMessage(fail)) throw new Error(fail);
+      const dead = evt.event === "INNER_EXCEPTION" || evt.event === "ERROR" || evt.event === "FAILED" || isDeadSessionMessage(fail);
+      if (dead) {
         try {
           const newId = await ensureSession(convId, question, true);
           const retryEvents = await imaQaStream(newId, question, modelType, modelId);
           for await (const e2 of retryEvents) yield e2;
         } catch (_) {
-          yield evt; // 重试也失败，把原始事件透传出去
+          yield evt;
         }
         return;
       }
@@ -230,18 +307,56 @@ async function imaQaStreamWithRetry(convId, question, modelType, modelId) {
   })();
 }
 
+async function* qaWithRotate(convId, question, modelType, modelId) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const events = await imaQaStreamWithRetry(
+        attempt ? `${convId}-r${attempt}` : convId,
+        question,
+        modelType,
+        modelId,
+      );
+      for await (const evt of events) yield evt;
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (!isRateLimitMessage(e.message) || !rotateAccountHandler) throw e;
+      const rotated = await rotateAccountHandler(e.message);
+      if (!rotated) throw e;
+      console.log(`[rotate] retry ask attempt=${attempt + 1}`);
+    }
+  }
+  throw lastErr || new Error("提问太快，账号都在冷却");
+}
+
 // ============================================================
 // 5. 模型
 // ============================================================
-const MODELS = CONFIG.models;
-const DEFAULT_MODEL = CONFIG.default_model;
+let MODELS = CONFIG.models;
+let DEFAULT_MODEL = CONFIG.default_model;
+
+const MODEL_ALIASES = {
+  "glm-5": "glm-5.3",
+  "glm-5.2": "glm-5.3",
+  "glm-5.2-think": "glm-5.3-think",
+  "hy3-preview": "hy-2.0",
+  "hy3-preview-think": "hy-2.0-think",
+  "deepseek-v4-flash": "deepseek-v3.2",
+  "deepseek-v4-flash-think": "deepseek-v3.2-think",
+};
 
 function resolveModel(requested) {
   if (!requested) return MODELS[DEFAULT_MODEL];
   if (MODELS[requested]) return MODELS[requested];
-  const lower = requested.toLowerCase();
+  const lower = String(requested).toLowerCase();
+  const alias = MODEL_ALIASES[lower];
+  if (alias && MODELS[alias]) return MODELS[alias];
   for (const [k, v] of Object.entries(MODELS)) {
-    if (k.toLowerCase() === lower || String(v.type) === lower) return v;
+    if (k.toLowerCase() === lower) return v;
+    if (String(v.type) === lower) return v;
+    if (String(v.id).toLowerCase() === lower) return v;
+    if (String(v.name || "").toLowerCase() === lower) return v;
   }
   return MODELS[DEFAULT_MODEL];
 }
@@ -286,6 +401,93 @@ function extractContent(msg) {
       return "";
     }).filter(Boolean).join("\n");
   return String(msg.content || "");
+}
+
+function clipText(s, n) {
+  const text = String(s || "");
+  if (text.length <= n) return text;
+  return text.slice(0, Math.max(0, n - 12)) + "\n...[截断]";
+}
+
+function compressSysPrompt(sysPrompt, budget) {
+  const context = String(sysPrompt || "");
+  if (!context || budget <= 0) return "";
+  if (context.length <= budget) return context;
+  const layoutMatch = context.match(/<project_layout>([\s\S]*?)<\/project_layout>/);
+  const layoutSummary = layoutMatch ? layoutMatch[1].trim().split("\n").slice(0, 20).join("\n") : "";
+  const headLen = Math.min(500, Math.floor(budget * 0.55));
+  const tailLen = Math.min(220, budget - headLen);
+  const head = context.slice(0, headLen);
+  const tail = context.length > headLen + tailLen ? context.slice(-tailLen) : "";
+  const layoutPart = layoutSummary
+    ? "\nDirectory:\n" + layoutSummary.slice(0, Math.min(220, Math.max(0, budget - headLen - tailLen - 20)))
+    : "";
+  return clipText(tail ? head + "\n...[truncated]..." + layoutPart + "\n" + tail : head + layoutPart, budget);
+}
+
+function deriveConvId(req, messages) {
+  const header = String((req && req.headers && (req.headers["x-conversation-id"] || req.headers["x-session-id"])) || "").trim();
+  if (header) return header;
+  for (const m of messages || []) {
+    if (m.role !== "user") continue;
+    const t = extractContent(m).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (t.length > 6) {
+      return "conv-" + crypto.createHash("md5").update(t.slice(0, 80)).digest("hex").slice(0, 16);
+    }
+  }
+  const fallback = extractContent((messages || [])[0] || {}).slice(0, 80);
+  return "conv-" + crypto.createHash("md5").update(fallback || "ima").digest("hex").slice(0, 16);
+}
+
+function packQuestion({ sysPrompt = "", toolsPrompt = "", turns = [], lastUser = "", langHint = "", maxLen = 10000 }) {
+  const last = clipText(lastUser, 2400);
+  const hint = langHint || "";
+  const goOn = toolsPrompt
+    ? "\n## Keep going\nIf the user asked you to build/write/package something, checking the environment is NOT done. After a check, immediately write files and finish the deliverable. Do not stop after inspection.\n"
+    : "";
+  const tail = `\n\n---\nUser message (respond to this):\n${last}${goOn}${hint}`;
+  let used = tail.length;
+  let tools = "";
+  if (toolsPrompt) {
+    const toolsBudget = Math.min(2800, Math.max(400, maxLen - used - 2200));
+    tools = clipText(toolsPrompt, toolsBudget) + "\n\n";
+    used += tools.length;
+  }
+  const histBudget = Math.min(5200, Math.max(0, maxLen - used - 400));
+  const parts = [];
+  let histLen = 0;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i] || {};
+    const text = String(t.text || "").trim();
+    if (!text) continue;
+    if (text === lastUser && t.role === "user" && i === turns.length - 1) continue;
+    let line = `${t.role === "user" ? "User" : "Assistant"}: ${text}`;
+    if (line.length > 1400) line = clipText(line, 1400);
+    if (histLen + line.length + 1 > histBudget && parts.length > 0) break;
+    parts.unshift(line);
+    histLen += line.length + 1;
+  }
+  const history = parts.length ? `Recent conversation:\n${parts.join("\n")}\n` : "";
+  used += history.length;
+  let sys = "";
+  const sysBudget = Math.min(900, Math.max(0, maxLen - used - 20));
+  if (sysPrompt && sysBudget > 120) {
+    sys = `(Background)\n${compressSysPrompt(sysPrompt, sysBudget)}\n\n`;
+  }
+  return sys + tools + history + tail;
+}
+
+function buildToolContinueQuestion({ origQ, calls, results, chinese, toolsPrompt }) {
+  const task = clipText(origQ || "", 1800);
+  const lines = [];
+  const n = Math.max(calls.length, results.length);
+  for (let i = 0; i < n; i++) {
+    lines.push(`调用: ${calls[i] || "(unknown)"}\n结果:\n"""\n${clipText(results[i] || "", 2200)}\n"""`);
+  }
+  const body = chinese
+    ? `用户任务还没完成。下面只是中间检查结果，不是最终答案。\n\n用户要的是：${task}\n\n${lines.join("\n\n")}\n\n规则：\n- 检查环境成功后必须立刻写文件、打包、给出成品路径。\n- 禁止只说「接下来我将…」然后停住。\n- 任务没做完就继续发 <function_call>。\n- 全部做完才用简体中文告诉用户结果。`
+    : `The user task is NOT finished. The outputs below are intermediate checks, not the final answer.\n\nUser request: ${task}\n\n${lines.join("\n\n")}\n\nRules:\n- After environment checks, immediately write files / package / return the deliverable path.\n- Do not stop after saying what you will do next.\n- If unfinished, emit another <function_call> now.\n- Only reply in plain text when the whole task is done.`;
+  return (toolsPrompt ? toolsPrompt + "\n\n---\n" : "") + body;
 }
 
 // ============================================================
@@ -573,55 +775,125 @@ class StreamFilter {
   get leftover() { return this._leftover; }
 }
 
-function parseFunctionCalls(text) {
-  if (!text) return { found: false, text: "" };
+function makeToolCall(name, args, availableNames) {
+  const want = String(name || "").trim();
+  const names = availableNames || [];
+  let resolved = names.find((n) => n.toLowerCase() === want.toLowerCase()) || want;
+  if (!names.some((n) => n.toLowerCase() === resolved.toLowerCase())) {
+    if (/^(bash|shell|sh|zsh|cmd|exec)$/i.test(want)) {
+      resolved = names.find((n) => /bash|shell|exec/i.test(n)) || resolved;
+    } else if (/^write/i.test(want)) {
+      resolved = names.find((n) => /^write$/i.test(n)) || resolved;
+    }
+  }
+  return {
+    id: "toolu_" + crypto.randomUUID().slice(0, 12),
+    type: "function",
+    function: {
+      name: resolved,
+      arguments: typeof args === "string" ? args : JSON.stringify(args || {}),
+    },
+  };
+}
 
-  // 也匹配 ```json {...} ``` 格式 (模型可能输出 JSON 代码块)
-  const jsonBlockRegex = /```(?:json)?\s*\n?\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})\s*\n?\s*```/g;
+const SHELL_HEAD = String.raw`pwd|ls|cd|python3?|pip3?|pyinstaller|mkdir|cat|echo|head|tail|npm|npx|node|git|curl|wget|chmod|rm|cp|mv|which|where|dir|type|uname|whoami|bash|sh`;
 
-  const regex = /<function_call>\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*<\/function_call>/g;
+function looksLikeShell(cmd) {
+  const t = String(cmd || "").trim();
+  if (t.length < 2) return false;
+  return new RegExp(`^(?:${SHELL_HEAD})\\b`, "i").test(t) || /&&|\|\||;/.test(t);
+}
+
+function firstShellIndex(text) {
+  const m = String(text || "").match(new RegExp(String.raw`\b(?:${SHELL_HEAD})\b`, "i"));
+  return m ? m.index : -1;
+}
+
+function parseFunctionCalls(text, availableNames = []) {
+  if (!text) return { found: false, calls: [], text: "" };
   const calls = [];
-  let cleanText = text;
+  let leftover = String(text);
 
-  // 尝试两种格式: <function_call> 和 ```json name/arguments
-  const patterns = [
-    regex,
-    /```(?:json)?\s*\n?\s*\{[^{}]*"name"\s*:\s*"[^"]+"[^{}]*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}\s*\n?\s*```/g,
-  ];
+  leftover = leftover.replace(/<function_call>\s*([\s\S]*?)\s*<\/function_call>/gi, (full, inner) => {
+    const parsed = tryRepairJson(String(inner || "").trim());
+    if (parsed && parsed.name) {
+      calls.push(makeToolCall(parsed.name, parsed.arguments || parsed.parameters || {}, availableNames));
+      return "";
+    }
+    return full;
+  });
 
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      const parsed = tryRepairJson(match[1].trim());
-      if (parsed && parsed.name) {
-        calls.push({
-          id: "toolu_" + crypto.randomUUID().slice(0, 12),
-          type: "function",
-          function: {
-            name: parsed.name || "",
-            arguments: JSON.stringify(parsed.arguments || parsed.parameters || {}),
-          },
-        });
+  leftover = leftover.replace(/```(?:json)?\s*\n?\s*(\{[\s\S]*?"name"\s*:[\s\S]*?\})\s*```/gi, (full, json) => {
+    const parsed = tryRepairJson(json);
+    if (parsed && parsed.name) {
+      calls.push(makeToolCall(parsed.name, parsed.arguments || parsed.parameters || {}, availableNames));
+      return "";
+    }
+    return full;
+  });
+
+  leftover = leftover.replace(/```(bash|sh|shell|zsh|cmd|powershell)?[ \t]*\n?([\s\S]*?)```/gi, (full, lang, body) => {
+    const cmd = String(body || "").trim();
+    if (!cmd) return full;
+    if (lang || looksLikeShell(cmd)) {
+      calls.push(makeToolCall("Bash", { command: cmd }, availableNames));
+      return "";
+    }
+    return full;
+  });
+
+  leftover = leftover.replace(/(?:^|\n)\s*(?:RUN|CMD|BASH|SHELL)\s*[:：]\s*([^\n`]+)(?=\n|$)/gi, (full, cmd) => {
+    const c = String(cmd || "").trim();
+    if (c) {
+      calls.push(makeToolCall("Bash", { command: c }, availableNames));
+      return "\n";
+    }
+    return full;
+  });
+
+  leftover = leftover.replace(/(?:^|\n)\s*(?:bash|shell)\s*[:：]?\s*\n?([^\n`]+)(?=\n|$)/gi, (full, cmd) => {
+    const c = String(cmd || "").trim();
+    if (looksLikeShell(c)) {
+      calls.push(makeToolCall("Bash", { command: c }, availableNames));
+      return "\n";
+    }
+    return full;
+  });
+
+  leftover = leftover.replace(/(?:Write|write_file|writeFile)\s+[^\n]*?((?:[A-Za-z]:\\|\/)[^\s]+)\s*\n```(?:\w+)?\s*\n([\s\S]*?)```/g, (_, filePath, content) => {
+    calls.push(makeToolCall("Write", { file_path: filePath.trim(), content }, availableNames));
+    return "";
+  });
+
+  leftover = leftover.replace(/(?:检查环境|查看环境|先检查|首先检查|Check environment)[:：]?\s*/gi, " ");
+
+  if (!calls.length) {
+    const idx = firstShellIndex(leftover);
+    if (idx >= 0) {
+      const cmd = leftover.slice(idx).replace(/[。．]+$/g, "").trim();
+      if (cmd.length >= 3) {
+        calls.push(makeToolCall("Bash", { command: cmd }, availableNames));
+        leftover = leftover.slice(0, idx).replace(/[:：]\s*$/, "");
       }
     }
-    if (calls.length > 0) break;
   }
 
-  if (calls.length > 0) {
-    cleanText = text.replace(regex, "").replace(/```(?:json)?\s*\n?\s*\{[\s\S]*?\}\s*\n?\s*```/g, "").trim();
-    return { found: true, calls, text: cleanText };
-  }
+  leftover = leftover
+    .replace(/Check environment|Write the calculator code/gi, "")
+    .replace(/```+/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
-  // 调试: 检查模型是否输出了近似的 function call 格式
-  if (text.includes('function') || text.includes('tool') || text.includes('bash') || text.includes('read_file')) {
-  }
-  return { found: false, text };
+  if (calls.length) console.log(`[tools] salvaged ${calls.length}: ${calls.map((c) => c.function.name).join(",")}`);
+  else console.log(`[tools] none preview=${String(text).replace(/\s+/g, " ").slice(0, 160)}`);
+  return { found: calls.length > 0, calls, text: leftover };
 }
 
 // ============================================================
 // 8. OpenAI /v1/chat/completions
 // ============================================================
 async function openaiChat(req, res, body) {
+  console.log(`[ask] openai model=${body.model || DEFAULT_MODEL} stream=${!!body.stream} msgs=${(body.messages || []).length}`);
   const modelKey = body.model || DEFAULT_MODEL;
   const model = resolveModel(modelKey);
   const stream = !!body.stream;
@@ -651,7 +923,7 @@ async function openaiChat(req, res, body) {
   const isTitleGenOAI = _sysPrompt.includes('Generate a concise, sentence-case title');
 
   // ⭐ 限制工具数量，防止 prompt 超出限制
-  const MAX_TOOLS_OAI = 8;
+  const MAX_TOOLS_OAI = 16;
   const ESSENTIAL_OAI = new Set(['Bash', 'Read', 'Write', 'Glob', 'Grep']);
   if (isTitleGenOAI) {
     effectiveTools = [];  // 标题生成不需要工具
@@ -663,6 +935,7 @@ async function openaiChat(req, res, body) {
   }
   const toolsPrompt = (effectiveTools && effectiveTools.length > 0 && toolChoice !== "none")
     ? buildToolsPrompt(effectiveTools) : "";
+  const oaiToolNames = (effectiveTools || []).map((t) => t.function?.name || t.name).filter(Boolean);
 
   let toolResultPathOAI = false;
 
@@ -693,26 +966,16 @@ async function openaiChat(req, res, body) {
     }
     const origQ = userQsOAI.length > 0 ? userQsOAI[userQsOAI.length - 1] : (lastUserTextOAI || "");
 
-    if (cjkOAI) {
-      question = "⚠️ 系统通知：你刚才调用了以下函数，返回结果如下：\n\n";
-      for (let i = 0; i < calledOAI.length; i++) {
-        question += "函数调用: " + calledOAI[i] + "\n返回结果:\n\"\"\"\n" + (resultsOAI[i] || "") + "\n\"\"\"\n\n";
-      }
-      question += "用户原始提问: \"" + origQ + "\"\n\n请用简体中文直接回答用户的问题。说出答案即可。不要说\"你分享了\"或\"看起来像是\"。上面用 \"\"\" 包裹的内容是你自己调用函数得到的返回结果。";
-    } else {
-      question = "⚠️ SYSTEM: You just called these functions and received these outputs:\n\n";
-      for (let i = 0; i < calledOAI.length; i++) {
-        question += "Function: " + calledOAI[i] + "\nOutput:\n\"\"\"\n" + (resultsOAI[i] || "") + "\n\"\"\"\n\n";
-      }
-      question += "User's original question: \"" + origQ + "\"\n\nAnswer DIRECTLY based on the outputs. Do NOT say \"you shared\" or \"it looks like\". The \"\"\" content is YOUR function output, NOT user input.";
-    }
-
-    // 工具结果回传轮: 不携带完整 sysPrompt, 仅 5 个核心工具
-    // ⭐ 用软版提示 — 允许模型直接用文字作答, 避免被强制再发 function_call 而沉默
     const minimalOAI = buildToolsPromptSoft(
       (effectiveTools || []).filter(t => ESSENTIAL_OAI.has(t.function?.name)).slice(0, 5)
     );
-    question = minimalOAI + "\n\n---\n" + question;
+    question = buildToolContinueQuestion({
+      origQ,
+      calls: calledOAI,
+      results: resultsOAI,
+      chinese: cjkOAI,
+      toolsPrompt: minimalOAI,
+    });
   } else {
     // 普通问答 / 首轮 tool calling
     let sysPrompt = "";
@@ -741,71 +1004,22 @@ async function openaiChat(req, res, body) {
     // IMA question 字段限制 10240 字符
     const MAX_QUESTION = 10000;
 
-    if (nonSys.length > 1 && realUserMsgs.length >= 1) {
-      const realMsgs = nonSys.filter(m => {
-        const c = extractContent(m);
-        return c.length > 10 && !c.startsWith('<session') && !c.startsWith('<system-reminder');
-      });
-      if (realMsgs.length > 1) {
-        // ⭐ 修复: 扩展到 20 条，按字符数动态裁剪
-        const MAX_HISTORY_CHARS = 6000;
-        const recentMsgs = realMsgs
-          .filter(m => m.role === "user" || m.role === "assistant")
-          .slice(-20);
-        let historyParts = [];
-        let historyLen = 0;
-        for (let i = recentMsgs.length - 1; i >= 0; i--) {
-          const m = recentMsgs[i];
-          const line = `${m.role === "user" ? "User" : "Assistant"}: ${extractContent(m)}`;
-          if (historyLen + line.length > MAX_HISTORY_CHARS && historyParts.length > 0) break;
-          historyParts.unshift(line);
-          historyLen += line.length + 1;
-        }
-        const history = historyParts.join("\n");
-        question = (sysPrompt ? sysPrompt + "\n\n" : "") + (toolsPrompt ? toolsPrompt + "\n\n---\n" : "") + history;
-      } else {
-        question = `${sysPrompt ? "(Background)\n" + sysPrompt + "\n\n" : ""}${toolsPrompt}\n\n---\nUser message (respond to this):\n${lastUserMsg}`;
-      }
-    } else {
-      // ⭐ 智能压缩 system prompt (保留 toolsPrompt 完整)
-      let context = sysPrompt;
-      const overhead = toolsPrompt.length + lastUserMsg.length + 200;
-      const remaining = MAX_QUESTION - overhead;
-
-      if (context && context.length > remaining && remaining > 0) {
-        // ⭐ 修复: 保留头尾，中间裁剪（保留核心规则 + 最新文件信息）
-        const layoutMatch = context.match(/<project_layout>([\s\S]*?)<\/project_layout>/);
-        const layoutSummary = layoutMatch
-          ? layoutMatch[1].trim().split("\n").slice(0, 30).join("\n")
-          : "";
-        const headLen = Math.min(800, Math.floor(remaining * 0.6));
-        const tailLen = Math.min(400, remaining - headLen);
-        const head = context.slice(0, headLen);
-        const tail = context.length > headLen + tailLen ? context.slice(-tailLen) : "";
-        const layoutPart = layoutSummary ? "\n\nDirectory (summary):\n" + layoutSummary.slice(0, Math.min(300, remaining - headLen - tailLen - 50)) : "";
-        context = tail ? head + "\n...[truncated]..." + layoutPart + "\n" + tail : head + layoutPart;
-        context = context.slice(0, remaining);
-      }
-
-      question = `${context ? "(Background)\n" + context + "\n\n" : ""}${toolsPrompt}\n\n---\nUser message (respond to this):\n${lastUserMsg}`;
-    }
-
-    // ⭐ 注入语言提示 & 截断 (工具结果回传轮跳过)
-    if (!toolResultPathOAI) {
-      question += langHintOAI;
-
-      // 最终截断 — 始终保留 toolsPrompt，否则模型看不到 function 定义
-      if (question.length > MAX_QUESTION) {
-        const minTemplate = "\n\n---\nUser message (respond to this):\n";
-        const compact = toolsPrompt + minTemplate + lastUserMsg + langHintOAI;
-        if (compact.length > MAX_QUESTION) {
-          const availForUser = Math.max(500, MAX_QUESTION - toolsPrompt.length - minTemplate.length - langHintOAI.length);
-          question = toolsPrompt + minTemplate + lastUserMsg.slice(0, Math.max(0, availForUser)) + langHintOAI;
-        } else {
-          question = compact;
-        }
-      }
-    }
+    const realMsgs = nonSys.filter(m => {
+      const c = extractContent(m);
+      return c.length > 6 && !c.startsWith('<session') && !c.startsWith('<system-reminder');
+    }).filter(m => m.role === "user" || m.role === "assistant");
+    const turns = realMsgs.slice(-24).map((m) => ({
+      role: m.role,
+      text: extractContent(m),
+    }));
+    question = packQuestion({
+      sysPrompt,
+      toolsPrompt,
+      turns,
+      lastUser: lastUserMsg,
+      langHint: langHintOAI,
+      maxLen: MAX_QUESTION,
+    });
   }
 
   if (!question) {
@@ -813,16 +1027,7 @@ async function openaiChat(req, res, body) {
   }
 
 
-  // 会话 — 复用 IMA session 保持对话记忆
-  // ⭐ 修复: 用系统 prompt 作为稳定锚点（同 Anthropic 路径保持一致）
-  let oaiConvId = req.headers["x-conversation-id"] || req.headers["x-session-id"] || "";
-  if (!oaiConvId && messages.length > 0) {
-    const sysMsg = messages.find(m => m.role === "system");
-    const anchor = sysMsg
-      ? extractContent(sysMsg).slice(0, 200)
-      : extractContent(messages[0]).slice(0, 200);
-    oaiConvId = "conv-" + crypto.createHash("md5").update(anchor).digest("hex").slice(0, 12);
-  }
+  const oaiConvId = deriveConvId(req, messages);
   let sessionId;
   try {
     sessionId = await ensureSession(oaiConvId, question.slice(0, 100));
@@ -833,9 +1038,9 @@ async function openaiChat(req, res, body) {
   // --- 非流式 ---
   if (!stream) {
     try {
-      const events = await imaQaStreamWithRetry(oaiConvId, question, model.type, model.id);
+      const events = qaWithRotate(oaiConvId, question, model.type, model.id);
       const text = await collectResponseText(events);
-      const parsed = parseFunctionCalls(text);
+      const parsed = parseFunctionCalls(text, oaiToolNames);
 
       const choice = { index: 0, message: {}, finish_reason: "stop" };
 
@@ -894,35 +1099,29 @@ async function openaiChat(req, res, body) {
   }
 
   try {
-    const events = await imaQaStreamWithRetry(oaiConvId, question, model.type, model.id);
-    const filter = new StreamFilter();
+    const events = qaWithRotate(oaiConvId, question, model.type, model.id);
     let done = false;
+    let rawText = "";
 
     let sawEvent = false;
     for await (const evt of events) {
       if (resClosed) break;
+      const fail = completedError(evt);
+      if (fail) throw new Error(fail);
       if (CONTROL_EVENTS.has(evt.event)) {
         if (evt.event === "COMPLETED" || evt.event === "CLOSE") done = true;
         break;
       }
       sawEvent = true;
       const txt = eventText(evt);
-      if (txt) {
-        const clean = filter.feed(txt);
-        if (clean) emit(clean, null, null);
-      }
+      if (txt) rawText += txt;
     }
     if (DEBUG_SSE && !sawEvent) console.error("[SSE-EMPTY] openai stream: no data events");
 
-    // 冲刷残留缓冲
-    const flushed = filter.flush();
-    if (flushed && !resClosed) emit(flushed, null, null);
-
-    // 检测并发送函数调用
+    const parsed = parseFunctionCalls(rawText, oaiToolNames);
     if (!resClosed) {
-      const calls = filter.parseCalls();
-      // ⭐ 无法解析的 function_call 残留 — 作为文本输出, 避免静默丢失
-      if (filter.leftover) emit(filter.leftover, null, null);
+      const calls = parsed.calls || [];
+      if (parsed.text) emit(parsed.text, null, null);
       if (calls.length > 0) {
         // ⭐ OpenAI streaming tool_calls: 逐个发送
         for (let i = 0; i < calls.length; i++) {
@@ -1004,7 +1203,7 @@ async function anthropicMessages(req, res, body) {
   const isTitleGen = sysPrompt.includes('Generate a concise, sentence-case title');
 
   // ⭐ 限制工具数量，防止 prompt 超出 IMA 10240 字符限制
-  const MAX_TOOLS = 8;
+  const MAX_TOOLS = 16;
   const ESSENTIAL_TOOLS = new Set(['Bash', 'Read', 'Write', 'Glob', 'Grep']);
   let displayTools = tools;
   if (isTitleGen) {
@@ -1016,6 +1215,7 @@ async function anthropicMessages(req, res, body) {
     const available = MAX_TOOLS - essential.length;
     displayTools = [...essential, ...others.slice(0, Math.max(0, available))];
   }
+  const anthropicToolNames = (displayTools || []).map((t) => t.name).filter(Boolean);
   // —— 过滤消息 ——
   // ⭐ 检测 Anthropic 格式的 tool_use / tool_result (多轮回传)
   function msgHasType(msg, type) {
@@ -1106,110 +1306,41 @@ async function anthropicMessages(req, res, body) {
     }
     const originalQuestion = userQs.length > 0 ? userQs[userQs.length - 1] : (lastUserMsg || "");
 
-    // 构建通知: 系统消息 + 函数调用 + 结果
-    if (isCJK) {
-      question = "⚠️ 系统通知：你刚才调用了以下函数，返回结果如下：\n\n";
-      for (let i = 0; i < calledFuncs.length; i++) {
-        question += "函数调用: " + calledFuncs[i] + "\n";
-        question += "返回结果:\n\"\"\"\n" + (results[i] || "") + "\n\"\"\"\n\n";
-      }
-      question += "用户原始提问: \"" + originalQuestion + "\"\n\n";
-      question += "请用简体中文直接回答用户的问题。说出答案即可。不要说\"你分享了\"或\"看起来像是\"或\"I see you've shared\"。上面用 \"\"\" 包裹的内容是你自己调用函数得到的返回结果，不是用户发给你的。";
-    } else {
-      question = "⚠️ SYSTEM: You just called these functions and received these outputs:\n\n";
-      for (let i = 0; i < calledFuncs.length; i++) {
-        question += "Function: " + calledFuncs[i] + "\n";
-        question += "Output:\n\"\"\"\n" + (results[i] || "") + "\n\"\"\"\n\n";
-      }
-      question += "User's original question: \"" + originalQuestion + "\"\n\n";
-      question += "Answer the user's question DIRECTLY based on the outputs above. Do NOT say \"you shared\" or \"I see you've shared\" or \"it looks like\". The content inside \"\"\" blocks is YOUR function output, NOT content the user sent you.";
-    }
-
-    // ⭐ 工具结果回传轮: 不携带完整 sysPrompt 和大量 tools (⚠️ 通知已提供足够上下文)
-    // 仅保留 5 个核心工具, 确保总长度 < 10000 不会被后面的通用截断逻辑破坏
-    // ⭐ 用软版提示 — 允许模型基于结果直接用文字回答, 而非被强制再发 function_call
     const minimalToolsPrompt = buildToolsPromptSoft(
       displayTools.filter(t => ESSENTIAL_TOOLS.has(t.name)).slice(0, 5)
         .map(t => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.input_schema || {} } }))
     );
-    question = minimalToolsPrompt + "\n\n---\n" + question;
+    question = buildToolContinueQuestion({
+      origQ: originalQuestion,
+      calls: calledFuncs,
+      results,
+      chinese: isCJK,
+      toolsPrompt: minimalToolsPrompt,
+    });
     // 跳过后续的 langHint 注入和通用截断 — 此路径的 question 已包含语言指令且 < 10000
-  } else if (nonSys.length > 1 && realUserMsgs.length >= 1) {
-    // 取真正的用户消息（过滤掉系统注入的元数据）
+  } else {
     const realMsgs = nonSys
       .filter(m => {
         const c = stripMetadata(extractContent(m));
         return c.length > 5;
-      });
-    if (realMsgs.length > 1) {
-      // ⭐ 修复: 从 6 条扩展到 20 条，并按总字符限制动态裁剪（保留最新的消息）
-      const MAX_HISTORY_CHARS = 6000; // 留出空间给 sysPrompt + toolsPrompt
-      const recentMsgs = realMsgs.slice(-20);
-      let historyParts = [];
-      let historyLen = 0;
-      for (let i = recentMsgs.length - 1; i >= 0; i--) {
-        const m = recentMsgs[i];
-        const line = (m.role === "user" ? "User" : "Assistant") + ": " + stripMetadata(extractContent(m));
-        if (historyLen + line.length > MAX_HISTORY_CHARS && historyParts.length > 0) break;
-        historyParts.unshift(line);
-        historyLen += line.length + 1;
-      }
-      question = historyParts.join("\n");
-      question = (sysPrompt ? sysPrompt + "\n\n" : "") + (toolsPrompt ? toolsPrompt + "\n\n---\n" : "") + question;
-    } else {
-      // 只有一条真正消息，走单轮路径
-      question = (sysPrompt ? "(Background)\n" + sysPrompt + "\n\n" : "") + toolsPrompt + "\n\n---\nUser message (respond to this):\n" + lastUserMsg;
-    }
-  } else {
-    let context = sysPrompt;
-    const overhead = toolsPrompt.length + lastUserMsg.length + 200;
-    const remaining = MAX_QUESTION - overhead;
-    if (context && context.length > remaining && remaining > 0) {
-      // ⭐ 修复: 保留头部（核心规则）+ 尾部（最新文件列表），中间裁剪
-      // 而非旧逻辑的"只保留前500字+目录"，那样会丢失大量重要指令
-      const layoutMatch = context.match(/<project_layout>([\s\S]*?)<\/project_layout>/);
-      const layoutSummary = layoutMatch ? layoutMatch[1].trim().split("\n").slice(0, 30).join("\n") : "";
-      const headLen = Math.min(800, Math.floor(remaining * 0.6));
-      const tailLen = Math.min(400, remaining - headLen);
-      const head = context.slice(0, headLen);
-      const tail = context.length > headLen + tailLen ? context.slice(-tailLen) : "";
-      const layoutPart = layoutSummary ? "\n\nDirectory (summary):\n" + layoutSummary.slice(0, Math.min(300, remaining - headLen - tailLen - 50)) : "";
-      context = tail ? head + "\n...[truncated]..." + layoutPart + "\n" + tail : head + layoutPart;
-      context = context.slice(0, remaining);
-    }
-    question = (context ? "(Background)\n" + context + "\n\n" : "") + toolsPrompt + "\n\n---\nUser message (respond to this):\n" + lastUserMsg;
-  }
-
-  // ⭐ 注入语言提示 & 截断 (工具结果回传轮跳过 — 已自带语言指令且 < 10000)
-  if (!toolResultPath) {
-    question += langHint;
-
-    if (question.length > MAX_QUESTION) {
-      const minTemplate = "\n\n---\nUser message (respond to this):\n";
-      const compact = toolsPrompt + minTemplate + lastUserMsg + langHint;
-      if (compact.length > MAX_QUESTION) {
-        const availForUser = Math.max(500, MAX_QUESTION - toolsPrompt.length - minTemplate.length - langHint.length);
-        question = toolsPrompt + minTemplate + lastUserMsg.slice(0, Math.max(0, availForUser)) + langHint;
-      } else {
-        question = compact;
-      }
-    }
+      })
+      .filter(m => m.role === "user" || m.role === "assistant");
+    const turns = realMsgs.slice(-24).map((m) => ({
+      role: m.role,
+      text: stripMetadata(extractContent(m)),
+    }));
+    question = packQuestion({
+      sysPrompt,
+      toolsPrompt,
+      turns,
+      lastUser: lastUserMsg,
+      langHint,
+      maxLen: MAX_QUESTION,
+    });
   }
 
 
-  // 会话 — ⭐ 关键: 必须复用 IMA session 才能保持对话记忆
-  const convId = req.headers["x-conversation-id"] || req.headers["x-session-id"] || "";
-  // ⭐ 修复: 用系统 prompt + 第一条用户消息的 hash 作为稳定会话锚点
-  // Claude Code 不发 x-conversation-id, 但同一对话的 system prompt 内容固定
-  let effectiveConvId = convId;
-  if (!effectiveConvId && messages.length > 0) {
-    // 优先用 system prompt (Claude Code 在 system 里放项目路径等固定信息)
-    const sysMsg = messages.find(m => m.role === "system");
-    const anchor = sysMsg
-      ? extractContent(sysMsg).slice(0, 200)           // system prompt 前200字，通常含项目路径
-      : extractContent(messages[0]).slice(0, 200);      // fallback: 第一条消息
-    effectiveConvId = "conv-" + crypto.createHash("md5").update(anchor).digest("hex").slice(0, 12);
-  }
+  const effectiveConvId = deriveConvId(req, messages);
   let sessionId;
   const isNewSession = !getCachedSession(effectiveConvId);
   try { sessionId = await ensureSession(effectiveConvId, question.slice(0, 100)); }
@@ -1221,9 +1352,9 @@ async function anthropicMessages(req, res, body) {
   // --- 非流式 ---
   if (!stream) {
     try {
-      const events = await imaQaStreamWithRetry(effectiveConvId, question, model.type, model.id);
+      const events = qaWithRotate(effectiveConvId, question, model.type, model.id);
       const text = await collectResponseText(events);
-      const parsed = parseFunctionCalls(text);
+      const parsed = parseFunctionCalls(text, anthropicToolNames);
 
       if (parsed.found && parsed.calls.length > 0) {
         const content = [];
@@ -1286,31 +1417,29 @@ async function anthropicMessages(req, res, body) {
   let stopReason = "end_turn";
   let done = false;
   let sentText = false;   // ⭐ 是否已发送过任何文本 delta (兜底判断)
-  const filter = new StreamFilter();
   let calls = [];  // 在 try 外声明，供后续 tool_use 发送使用
   try {
-    const events = await imaQaStreamWithRetry(effectiveConvId, question, model.type, model.id);
+    const events = qaWithRotate(effectiveConvId, question, model.type, model.id);
+    let rawText = "";
 
     for await (const evt of events) {
       if (resClosed) break;
+      const fail = completedError(evt);
+      if (fail) throw new Error(fail);
       if (CONTROL_EVENTS.has(evt.event)) {
         if (evt.event === "COMPLETED" || evt.event === "CLOSE") done = true;
         break;
       }
       const txt = eventText(evt);
-      if (txt) {
-        const clean = filter.feed(txt);
-        if (clean) { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: clean } }); sentText = true; }
-      }
+      if (txt) rawText += txt;
     }
 
-    // 冲刷残留缓冲
-    const flushed = filter.flush();
-    if (flushed && !resClosed) { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: flushed } }); sentText = true; }
-
-    calls = filter.parseCalls();
-    // ⭐ 无法解析的 function_call 残留 — 作为文本输出, 避免静默丢失
-    if (filter.leftover && !resClosed) { em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: filter.leftover } }); sentText = true; }
+    const parsed = parseFunctionCalls(rawText, anthropicToolNames);
+    calls = parsed.calls || [];
+    if (parsed.text && !resClosed) {
+      em("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: parsed.text } });
+      sentText = true;
+    }
 
     // ⭐ 兜底: 流结束但既无文本也无工具调用 — 绝不让客户端收到完全空的回复。
     // 这是 Claude Code "执行命令后无任何回复就结束" 的最终防线。
@@ -1355,11 +1484,19 @@ async function anthropicMessages(req, res, body) {
 // ============================================================
 // 10. 路由
 // ============================================================
+function normalizeUrlPath(raw) {
+  const text = String(raw || "/");
+  const q = text.indexOf("?");
+  const pathPart = (q >= 0 ? text.slice(0, q) : text).replace(/\/{2,}/g, "/") || "/";
+  return q >= 0 ? `${pathPart}${text.slice(q)}` : pathPart;
+}
+
 async function router(req, res) {
   cors(res);
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
-  const url = req.url;
+  const url = normalizeUrlPath(req.url);
+  req.url = url;
   const urlPath = url.split("?")[0];
 
   if (urlPath === "/health") return json(res, 200, { status: "ok" });
@@ -1450,8 +1587,27 @@ async function router(req, res) {
 const PORT = CONFIG.server?.port || 8080;
 const HOST = CONFIG.server?.host || "0.0.0.0";
 
-http.createServer(router).listen(PORT, HOST, () => {
-  for (const [id] of Object.entries(MODELS)) {
-  }
-  for (const k of API_KEYS) console.log(`║    ${maskKey(k).padEnd(44)}║`);
-});
+applyConfig(CONFIG);
+
+function startApiServer(port = PORT, host = HOST) {
+  return http.createServer(router).listen(port, host, () => {
+    for (const k of API_KEYS) console.log(`║    ${maskKey(k).padEnd(44)}║`);
+  });
+}
+
+if (require.main === module) startApiServer();
+
+module.exports = {
+  router,
+  applyConfig,
+  loadConfigFromDisk,
+  clearImaSessions,
+  setRotateHandler,
+  isRateLimitMessage,
+  getRuntime: () => ({ CONFIG, COOKIE, IMA_TOKEN, BKN, API_KEYS, MODELS, DEFAULT_MODEL, IMA_HEADERS }),
+  startApiServer,
+  json,
+  checkAuth,
+  maskKey,
+  calcBkn,
+};
